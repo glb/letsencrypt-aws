@@ -2,22 +2,33 @@
 
 `letsencrypt-aws` is a program that can be run in the background which
 automatically provisions and updates certificates on your AWS infrastructure
-using the AWS APIs and Let's Encrypt.
+using the AWS APIs and [Let's Encrypt](https://letsencrypt.org/).
 
 ## How it works
 
-`letsencrypt-aws` takes a list of ELBs, and which hosts you want them to be
-able to serve. It runs in a loop and every day does the following:
+`letsencrypt-aws` takes a list of resources, which can be either ELBs and
+which fully-qualified domain names (FQDNs) you want them to be able to serve,
+or CloudFront distributions. It runs in a loop and every day does the following:
 
-It gets the certificate for that ELB. If the certificate is going to expire
-soon (in less than 45 days), it generates a new private key and CSR and sends a
-request to Let's Encrypt. It takes the DNS challenge and creates a record in
-Route53 for that challenge. This completes the Let's Encrypt challenge and we
-receive a certificate. It uploads the new certificate and private key to IAM
-and updates your ELB to use the certificate.
+1. Checks whether the current certificate for the resource is going to
+   expire soon (in less than 45 days).
+
+2. Generates a new private key and CSR and sends a request to Let's Encrypt.
+
+3. Takes the DNS challenge from Let's Encrypt and creates a record in Route53
+   for that challenge.
+
+4. Completes the Let's Encrypt challenge and receives a certificate.
+
+5. Uploads the new certificate and private key to IAM and updates your
+   resource to use the certificate.
 
 In theory all you need to do is make sure this is running somewhere, and your
-ELBs' certificates will be kept minty fresh.
+ELB and CloudFront certificates will be kept minty-fresh.
+
+**WARNING**: `letsencrypt-aws` currently leaves a trail of expired certificates
+behind. Until that's fixed, you'll want to have a separate process that goes in
+and cleans them up.
 
 ## How to run it
 
@@ -46,19 +57,26 @@ boto3](https://boto3.readthedocs.org/en/latest/guide/configuration.html), or
 use IAM instance profiles (which are supported, but not mentioned by the
 `boto3` documentation). See below for which AWS permissions are required.
 
-`letsencrypt-aws` takes it's configuration via the `LETSENCRYPT_AWS_CONFIG`
-environment variable. This should be a JSON object with the following schema:
+`letsencrypt-aws` takes its configuration via the `LETSENCRYPT_AWS_CONFIG`
+environment variable. The contents of the environment variable should be a JSON
+object with the following schema:
 
 ```json
 {
-    "domains": [
+    "resources": [
         {
             "elb": {
                 "name": "ELB name (string)",
                 "port": "optional, defaults to 443 (integer)"
             },
-            "hosts": ["list of hosts you want on the certificate (strings)"],
+            "fqdns": ["list of FQDNs you want in the certificate (strings)"],
             "key_type": "rsa or ecdsa, optional, defaults to rsa (string)"
+        },
+        {
+            "cloudfront": {
+                "id": "CloudFront distribution ID (string)",
+                "key_type": "rsa, optional, defaults to rsa (string)"
+            }
         }
     ],
     "acme_account_key": "location of the account private key (string)",
@@ -68,21 +86,29 @@ environment variable. This should be a JSON object with the following schema:
 
 The `acme_account_key` can either be located on the local filesystem or in S3.
 To specify a local file you provide `"file:///path/to/key.pem"`, for S3 provide
-`"s3://bucket-nam/object-name"`. The key should be a PEM formatted RSA private
+`"s3://bucket-name/object-name"`. The key should be a PEM-formatted RSA private
 key.
 
-Then you can simply run it: `python letsencrypt-aws.py update-certificates`.
+Then you can simply run `python letsencrypt-aws.py update-certificates`.
 
 If you add the `--persistent` flag it will run forever, rather than just once,
 sleeping for 24 hours between each check for certificate expiration. This is
 useful for production environments.
 
 If your certificate is not expiring soon, but you need to issue a new one
-anyways, the `--force-issue` flag can be provided.
+anyway, the `--force-issue` flag can be provided.
 
-If you're into [Docker](https://www.docker.com/), there is an automatically
-built image of `letsencrypt-aws` available as
+If you're into [Docker](https://www.docker.com/), there is an automatically-built
+image of `letsencrypt-aws` available as
 [`alexgaynor/letsencrypt-aws`](https://hub.docker.com/r/alexgaynor/letsencrypt-aws/).
+
+## CloudFront and ECDSA
+
+[Amazon CloudFront does not currently support ECDSA keys](http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/SecureConnections.html#CNAMEsAndHTTPS):
+
+> *Private Key*
+> [...] It must also be an RSA private key in PEM format, where the PEM header is
+> `BEGIN RSA PRIVATE KEY` and the footer is `END RSA PRIVATE KEY`. [...]
 
 ## Operational Security
 
@@ -108,19 +134,22 @@ The minimum set of permissions needed for `letsencrypt-aws` to work is:
 * `route53:ChangeResourceRecordSets`
 * `route53:GetChange`
 * `route53:ListHostedZones`
-* `elasticloadbalancing:DescribeLoadBalancers`
-* `elasticloadbalancing:SetLoadBalancerListenerSSLCertificate`
 * `iam:ListServerCertificates`
 * `iam:UploadServerCertificate`
+
+plus (for ELBs):
+* `elasticloadbalancing:DescribeLoadBalancers`
+* `elasticloadbalancing:SetLoadBalancerListenerSSLCertificate`
+
+and / or (for CloudFront distributions):
+* `cloudfront:GetDistributionConfig`
+* `cloudfront:UpdateDistribution`
 
 If your `acme_account_key` is provided as an `s3://` URI you will also need:
 
 * `s3:GetObject`
 
-It's likely possible to restrict these permissions by ARN, though this has not
-been fully explored.
-
-An example IAM policy is:
+#### Sample IAM Policy
 
 ```json
 {
@@ -154,6 +183,17 @@ An example IAM policy is:
             "Sid": "",
             "Effect": "Allow",
             "Action": [
+                "cloudfront:GetDistributionConfig",
+                "cloudfront:UpdateDistribution"
+            ],
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Sid": "",
+            "Effect": "Allow",
+            "Action": [
                 "iam:ListServerCertificates",
                 "iam:UploadServerCertificate"
             ],
@@ -164,3 +204,6 @@ An example IAM policy is:
     ]
 }
 ```
+
+You can of course restrict these permissions further using the magic of IAM;
+this is left as an exercise to the reader.
